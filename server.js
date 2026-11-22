@@ -79,7 +79,9 @@ function isAllowedSoundCloudHost(hostname) {
     host === "sndcdn.com" ||
     host.endsWith(".sndcdn.com") ||
     host === "soundcloud.com" ||
-    host.endsWith(".soundcloud.com")
+    host.endsWith(".soundcloud.com") ||
+    host === "soundcloud.cloud" ||
+    host.endsWith(".soundcloud.cloud")
   );
 }
 
@@ -489,7 +491,11 @@ function createConverterServer(options = {}) {
       return sendJson(res, 200, { ok: true, service: "sc-hls-to-m4a" });
     }
 
-    if (u.pathname !== "/convert") {
+    const isConvertRoute =
+      u.pathname === "/convert" ||
+      u.pathname === "/convert.m4a" ||
+      u.pathname === "/convert.mp3";
+    if (!isConvertRoute) {
       return sendJson(res, 404, { error: "unknown endpoint" });
     }
 
@@ -509,7 +515,13 @@ function createConverterServer(options = {}) {
       return sendJson(res, 400, { error: "bad or disallowed url" });
     }
 
-    const out = u.searchParams.get("out") === "mp3" ? "mp3" : "m4a";
+    const defaultOut = u.pathname === "/convert.mp3" ? "mp3" : "m4a";
+    const out =
+      u.searchParams.get("out") === "mp3"
+        ? "mp3"
+        : u.searchParams.get("out") === "m4a"
+          ? "m4a"
+          : defaultOut;
     const sourceCodec = (u.searchParams.get("sourceCodec") || "aac").toLowerCase();
     const trackId = u.searchParams.get("trackId") || "";
     const quality = u.searchParams.get("quality") || "sq";
@@ -543,6 +555,7 @@ function createConverterServer(options = {}) {
       if (res.writableEnded || res.destroyed) return;
       return serveFile(req, res, fileInfo, { filename, isDownload });
     } catch (err) {
+      console.error("convert failed:", err.message || err);
       if (res.writableEnded || res.destroyed) return;
       const status = err.code === "FFMPEG_SPAWN" ? 500 : 502;
       return sendJson(res, status, {
