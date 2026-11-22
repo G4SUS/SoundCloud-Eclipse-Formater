@@ -1,7 +1,7 @@
 /**
  * SoundCloud HLS -> m4a converter (render.com edition).
  *
- * GET /convert?url=<m3u8-url>[&licenseAuthToken=<token>][&key=<secret>]
+ * GET /convert?url=<m3u8-url>[&licenseAuthToken=<token>][&key=<secret>][&filename=<name>]
  *
  * Fetches the SoundCloud HLS playlist via ffmpeg and remuxes it to a single
  * fragmented MP4 (m4a) with the AAC audio stream copied — no re-encode,
@@ -10,6 +10,7 @@
  * Env vars:
  *   PORT            - listen port (render.com sets this automatically)
  *   CONVERTER_KEY   - optional shared secret; if set, every request must pass ?key=
+ *   FFMPEG_PATH     - optional path to an ffmpeg binary (overrides bundled one)
  */
 
 const http = require("http");
@@ -17,6 +18,13 @@ const { spawn } = require("child_process");
 
 const PORT = process.env.PORT || 3000;
 const KEY = process.env.CONVERTER_KEY || "";
+
+/* Find ffmpeg: env override, bundled ffmpeg-static (npm), or system PATH. */
+let FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
+try {
+  const ffmpegStatic = require("ffmpeg-static");
+  if (ffmpegStatic) FFMPEG = ffmpegStatic;
+} catch (_) {}
 
 /* Only allow SoundCloud media hosts as conversion sources. */
 const ALLOWED_HOSTS = [
@@ -66,14 +74,26 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 401, { error: "invalid key" });
   }
 
-  const source = sanitizeSource(u.searchParams.get("url"), u.searchParams.get("licenseAuthToken"));
+  const source = sanitizeSource(
+    u.searchParams.get("url"),
+    u.searchParams.get("licenseAuthToken")
+  );
   if (!source) {
     return sendJson(res, 400, { error: "bad or disallowed url" });
   }
 
-  const filename = (u.searchParams.get("filename") || "soundcloud-track").replace(/[^\w.-]+/g, "_");
+  const filename = (u.searchParams.get("filename") || "soundcloud-track").replace(
+    /[^\w.-]+/g,
+    "_"
+  );
 
-  const ffmpeg = spawn("ffmpeg", [
+  const headers = {
+    "Content-Type": "audio/mp4",
+    "Content-Disposition": `attachment; filename="${filename}.m4a"`,
+    "Access-Control-Allow-Origin": "*",
+  };
+
+  const ffmpeg = spawn(FFMPEG, [
     "-hide_banner",
     "-loglevel", "error",
     "-user_agent", UA,
@@ -87,29 +107,17 @@ const server = http.createServer((req, res) => {
   ]);
 
   let headerSent = false;
-  ffmpeg.stdout.once("data", () => {
+  function sendOkHeaders() {
     if (headerSent) return;
     headerSent = true;
-    res.writeHead(200, {
-      "Content-Type": "audio/mp4",
-      "Content-Disposition": `attachment; filename="${filename}.m4a"`,
-      "Access-Control-Allow-Origin": "*",
-    });
-  });
+    res.writeHead(200, headers);
+  }
+
+  /* Send headers as soon as real data is flowing. */
+  ffmpeg.stdout.once("data", sendOkHeaders);
 
   /* Fallback headers in case ffmpeg produced no output at all. */
-  ffmpeg.on("spawn", () => {
-    setTimeout(() => {
-      if (!headerSent && !res.headersSent) {
-        headerSent = true;
-        res.writeHead(200, {
-          "Content-Type": "audio/mp4",
-          "Content-Disposition": `attachment; filename="${filename}.m4a"`,
-          "Access-Control-Allow-Origin": "*",
-        });
-      }
-    }, 4000);
-  });
+  setTimeout(sendOkHeaders, 4000);
 
   ffmpeg.stdout.pipe(res);
 
@@ -123,20 +131,27 @@ const server = http.createServer((req, res) => {
     if (!res.writableEnded) ffmpeg.kill("SIGKILL");
   });
 
+  ffmpeg.on("error", (err) => {
+    /* Couldn't spawn ffmpeg at all (e.g. missing binary). */
+    if (!headerSent) {
+      headerSent = true;
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "ffmpeg spawn failed", detail: String(err) }));
+    }
+  });
+
   ffmpeg.on("close", (code) => {
     if (res.writableEnded) return;
     if (!headerSent) {
       headerSent = true;
       if (code === 0) {
-        res.writeHead(200, {
-          "Content-Type": "audio/mp4",
-          "Content-Disposition": `attachment; filename="${filename}.m4a"`,
-          "Access-Control-Allow-Origin": "*",
-        });
+        res.writeHead(200, headers);
         res.end();
       } else {
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "ffmpeg failed", detail: errBuf.slice(-800) }));
+        res.end(
+          JSON.stringify({ error: "ffmpeg failed", detail: errBuf.slice(-800) })
+        );
       }
     } else if (code !== 0) {
       console.error("ffmpeg exit", code, errBuf.slice(-800));
@@ -146,4 +161,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`sc-hls-to-m4a listening on :${PORT}`);
+  console.log(`using ffmpeg: ${FFMPEG}`);
 });
