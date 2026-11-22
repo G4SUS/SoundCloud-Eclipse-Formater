@@ -138,6 +138,25 @@ function buildCacheKey({ source, trackId, quality, out, sourceCodec }) {
     .slice(0, 32);
 }
 
+function saveJobMeta(cacheKey, meta) {
+  try {
+    ensureCacheDir();
+    fs.writeFileSync(
+      path.join(CACHE_DIR, `${cacheKey}.json`),
+      JSON.stringify({ ...meta, ts: Date.now() })
+    );
+  } catch (_) {}
+}
+
+function loadJobMeta(cacheKey) {
+  try {
+    const raw = fs.readFileSync(path.join(CACHE_DIR, `${cacheKey}.json`), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.source) return parsed;
+  } catch (_) {}
+  return null;
+}
+
 function parseRange(rangeHeader, totalSize) {
   if (!rangeHeader) return null;
   const trimmed = String(rangeHeader).trim();
@@ -588,6 +607,10 @@ function pruneCache() {
         try {
           fs.unlinkSync(entry.full);
         } catch (_) {}
+        try {
+          const metaPath = entry.full.replace(/\.(m4a|mp3)$/, ".json");
+          if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+        } catch (_) {}
       } else {
         kept.push(entry);
       }
@@ -604,6 +627,10 @@ function pruneCache() {
       try {
         fs.unlinkSync(entry.full);
         totalBytes -= entry.size;
+      } catch (_) {}
+      try {
+        const metaPath = entry.full.replace(/\.(m4a|mp3)$/, ".json");
+        if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
       } catch (_) {}
     }
   } catch (_) {}
@@ -862,12 +889,14 @@ function createConverterServer(options = {}) {
       });
     }
 
+    const audioMatch = /^\/audio\/([a-f0-9]{16,64})\.(m4a|mp3)$/i.exec(u.pathname);
+    const isAudioTokenRoute = Boolean(audioMatch);
     const isPrepareRoute = u.pathname === "/prepare";
     const isConvertRoute =
       u.pathname === "/convert" ||
       u.pathname === "/convert.m4a" ||
       u.pathname === "/convert.mp3";
-    if (!isConvertRoute && !isPrepareRoute) {
+    if (!isConvertRoute && !isPrepareRoute && !isAudioTokenRoute) {
       return sendJson(res, 404, { error: "unknown endpoint" });
     }
 
@@ -877,6 +906,63 @@ function createConverterServer(options = {}) {
 
     if (keySecret && u.searchParams.get("key") !== keySecret) {
       return sendJson(res, 401, { error: "invalid key" });
+    }
+
+    if (isAudioTokenRoute) {
+      const token = audioMatch[1].toLowerCase();
+      const ext = audioMatch[2].toLowerCase();
+      const contentType = ext === "mp3" ? "audio/mpeg" : "audio/mp4";
+      ensureCacheDir();
+      const finalPath = path.join(CACHE_DIR, `${token}.${ext}`);
+      const meta = loadJobMeta(token);
+      const filename = sanitizeFilename(
+        u.searchParams.get("filename") || (meta && meta.filename) || "soundcloud-track"
+      );
+      const isDownload = u.searchParams.get("download") === "1";
+
+      try {
+        const st = fs.statSync(finalPath);
+        if (st.size > 0 && Date.now() - st.mtimeMs < CACHE_TTL_MS) {
+          const now = new Date();
+          fs.utimes(finalPath, now, now, () => {});
+          return serveFile(
+            req,
+            res,
+            { filePath: finalPath, size: st.size, contentType, ext },
+            { filename, isDownload }
+          );
+        }
+      } catch (_) {}
+
+      if (inflight.has(token)) {
+        try {
+          const fileInfo = await inflight.get(token);
+          if (res.writableEnded || res.destroyed) return;
+          return serveFile(req, res, fileInfo, { filename, isDownload });
+        } catch (err) {
+          if (res.writableEnded || res.destroyed) return;
+          return sendJson(res, 502, {
+            error: "ffmpeg failed",
+            detail: String((err && err.message) || err).slice(-800),
+          });
+        }
+      }
+
+      if (meta && meta.source) {
+        try {
+          const fileInfo = await ensureConverted({ ...meta, ffmpegBin });
+          if (res.writableEnded || res.destroyed) return;
+          return serveFile(req, res, fileInfo, { filename, isDownload });
+        } catch (err) {
+          if (res.writableEnded || res.destroyed) return;
+          return sendJson(res, 502, {
+            error: "ffmpeg failed",
+            detail: String((err && err.message) || err).slice(-800),
+          });
+        }
+      }
+
+      return sendJson(res, 404, { error: "audio token not found or expired" });
     }
 
     const source = sanitizeSource(
@@ -909,8 +995,20 @@ function createConverterServer(options = {}) {
         out,
         sourceCodec,
       });
+      saveJobMeta(cached.cacheKey, {
+        source,
+        trackId,
+        quality,
+        out,
+        sourceCodec,
+        filename,
+      });
       if (cached.filePath) {
-        return sendJson(res, 200, { status: "ready", size: cached.size });
+        return sendJson(res, 200, {
+          status: "ready",
+          size: cached.size,
+          token: cached.cacheKey,
+        });
       }
       const prevErr = recentErrors.get(cached.cacheKey);
       if (prevErr && Date.now() - prevErr.ts < ERROR_CACHE_MS) {
@@ -934,7 +1032,11 @@ function createConverterServer(options = {}) {
 
       const outcome = await Promise.race([
         job
-          .then((info) => ({ status: "ready", size: info.size }))
+          .then((info) => ({
+            status: "ready",
+            size: info.size,
+            token: cached.cacheKey,
+          }))
           .catch((err) => ({
             status: "error",
             error: String(err.message || err).slice(-300),
@@ -945,7 +1047,7 @@ function createConverterServer(options = {}) {
             const longTrack = Boolean(
               meta && (meta.totalDurationSec > 900 || meta.segmentCount > 90)
             );
-            resolve({ status: "converting", longTrack });
+            resolve({ status: "converting", longTrack, token: cached.cacheKey });
           }, waitMs)
         ),
       ]);
