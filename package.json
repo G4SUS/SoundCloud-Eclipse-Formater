@@ -1,0 +1,15 @@
+{
+  "name": "sc-hls-to-m4a",
+  "version": "1.0.0",
+  "description": "SoundCloud HLS -> m4a converter (render.com)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  }
+}
