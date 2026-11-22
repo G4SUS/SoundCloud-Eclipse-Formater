@@ -68,6 +68,7 @@ const CORS_HEADERS = {
 };
 
 const inflight = new Map();
+const inflightMeta = new Map();
 const activeReads = new Map();
 const recentErrors = new Map();
 
@@ -641,6 +642,10 @@ async function ensureConverted({
 
     try {
       const downloaded = await downloadSourceToJobDir(source, jobDir);
+      inflightMeta.set(cacheKey, {
+        totalDurationSec: downloaded.totalDurationSec || 0,
+        segmentCount: downloaded.segmentPaths.length || 0,
+      });
 
       /* If direct MP3 and out=mp3, no ffmpeg needed at all. */
       if (downloaded.mode === "direct" && out === "mp3" && sourceCodec === "mp3") {
@@ -729,6 +734,7 @@ async function ensureConverted({
     return await job;
   } finally {
     inflight.delete(cacheKey);
+    inflightMeta.delete(cacheKey);
   }
 }
 
@@ -913,7 +919,7 @@ function createConverterServer(options = {}) {
 
       const waitMs = Math.min(
         8000,
-        Math.max(0, Number(u.searchParams.get("waitMs") || 2500))
+        Math.max(0, Number(u.searchParams.get("waitMs") || 2200))
       );
       const job = ensureConverted({
         source,
@@ -934,7 +940,13 @@ function createConverterServer(options = {}) {
             error: String(err.message || err).slice(-300),
           })),
         new Promise((resolve) =>
-          setTimeout(() => resolve({ status: "converting" }), waitMs)
+          setTimeout(() => {
+            const meta = inflightMeta.get(cached.cacheKey);
+            const longTrack = Boolean(
+              meta && (meta.totalDurationSec > 900 || meta.segmentCount > 90)
+            );
+            resolve({ status: "converting", longTrack });
+          }, waitMs)
         ),
       ]);
 
