@@ -61,9 +61,10 @@ const UA =
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Range, X-Eclipse-Access",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Range, If-Range, If-None-Match, Cache-Control, Authorization, X-Eclipse-Access",
   "Access-Control-Expose-Headers":
-    "Content-Length, Content-Range, Accept-Ranges, Content-Disposition",
+    "Content-Length, Content-Range, Accept-Ranges, Content-Disposition, ETag, Last-Modified",
 };
 
 const inflight = new Map();
@@ -214,19 +215,40 @@ function runFfmpeg(args, timeoutMs = CONVERSION_TIMEOUT_MS, ffmpegBin = FFMPEG) 
   });
 }
 
-async function fetchBuffer(url, timeoutMs = 25000) {
-  const resp = await fetch(url, {
-    headers: { "User-Agent": UA },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!resp.ok) {
-    throw new Error(`Upstream HTTP ${resp.status} for ${new URL(url).hostname}`);
+async function fetchBufferOnce(url, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      headers: { "User-Agent": UA },
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      const err = new Error(
+        `Upstream HTTP ${resp.status} for ${new URL(url).hostname}`
+      );
+      err.status = resp.status;
+      throw err;
+    }
+    const ab = await resp.arrayBuffer();
+    return {
+      buf: Buffer.from(ab),
+      contentType: (resp.headers.get("content-type") || "").toLowerCase(),
+    };
+  } finally {
+    clearTimeout(timer);
   }
-  const ab = await resp.arrayBuffer();
-  return {
-    buf: Buffer.from(ab),
-    contentType: (resp.headers.get("content-type") || "").toLowerCase(),
-  };
+}
+
+async function fetchBuffer(url, timeoutMs = 25000) {
+  try {
+    return await fetchBufferOnce(url, timeoutMs);
+  } catch (err) {
+    const status = err && err.status;
+    if (status && status >= 400 && status < 500 && status !== 429) throw err;
+    await new Promise((r) => setTimeout(r, 300));
+    return fetchBufferOnce(url, timeoutMs);
+  }
 }
 
 function pickMasterVariant(playlistText, baseUrl) {
@@ -662,8 +684,8 @@ async function ensureConverted({
         }
       }
 
-      /* Pure-JS fMP4 fallback if ffmpeg crashed/missing and source is fMP4 HLS */
-      if (!convertedOk && out === "m4a" && downloaded.initPath) {
+      /* Pure-JS fMP4 fallback if ffmpeg crashed/missing and source is AAC fMP4 HLS */
+      if (!convertedOk && out === "m4a" && sourceCodec !== "opus" && downloaded.initPath) {
         const ok = assembleFmp4Fallback({
           initPath: downloaded.initPath,
           segmentPaths: downloaded.segmentPaths,
@@ -727,11 +749,18 @@ function getCachedFileInfo({ source, trackId, quality, out, sourceCodec }) {
 
 function serveFile(req, res, fileInfo, { filename, isDownload }) {
   const { filePath, size, contentType, ext } = fileInfo;
+  let mtimeUtc;
+  try {
+    mtimeUtc = fs.statSync(filePath).mtime.toUTCString();
+  } catch (_) {}
+  const etag = `"${path.basename(filePath)}-${size}"`;
   const baseHeaders = {
     ...CORS_HEADERS,
     "Content-Type": contentType,
     "Accept-Ranges": "bytes",
     "Cache-Control": "public, max-age=1800",
+    ETag: etag,
+    ...(mtimeUtc ? { "Last-Modified": mtimeUtc } : {}),
     ...(isDownload
       ? { "Content-Disposition": `attachment; filename="${filename}.${ext}"` }
       : {}),
@@ -808,7 +837,11 @@ function createConverterServer(options = {}) {
 
   return http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") {
-      res.writeHead(204, CORS_HEADERS);
+      const reqHeaders = req.headers["access-control-request-headers"];
+      res.writeHead(204, {
+        ...CORS_HEADERS,
+        ...(reqHeaders ? { "Access-Control-Allow-Headers": reqHeaders } : {}),
+      });
       return res.end();
     }
 
