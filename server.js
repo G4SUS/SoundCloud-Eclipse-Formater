@@ -27,7 +27,8 @@ const MAX_CACHE_BYTES =
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 30 * 60 * 1000;
 const CONVERSION_TIMEOUT_MS =
   Number(process.env.CONVERSION_TIMEOUT_MS) || 120 * 1000;
-const SEGMENT_CONCURRENCY = 6;
+const SEGMENT_CONCURRENCY = 10;
+const ERROR_CACHE_MS = 15 * 1000;
 
 function resolveWorkingFfmpeg() {
   const candidates = [];
@@ -67,6 +68,7 @@ const CORS_HEADERS = {
 
 const inflight = new Map();
 const activeReads = new Map();
+const recentErrors = new Map();
 
 function ensureCacheDir() {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -495,7 +497,7 @@ function buildFfmpegStrategies({ inputPath, isHlsInput, out, sourceCodec, partPa
       "-c:a",
       "copy",
       "-f",
-      "mp4",
+      "ipod",
       "-movflags",
       "+faststart",
       partPath,
@@ -506,6 +508,16 @@ function buildFfmpegStrategies({ inputPath, isHlsInput, out, sourceCodec, partPa
       "copy",
       "-bsf:a",
       "aac_adtstoasc",
+      "-f",
+      "ipod",
+      "-movflags",
+      "+faststart",
+      partPath,
+    ]);
+    strategies.push([
+      ...inputArgs,
+      "-c:a",
+      "copy",
       "-f",
       "mp4",
       "-movflags",
@@ -520,7 +532,7 @@ function buildFfmpegStrategies({ inputPath, isHlsInput, out, sourceCodec, partPa
     "-b:a",
     "192k",
     "-f",
-    "mp4",
+    "ipod",
     "-movflags",
     "+faststart",
     partPath,
@@ -666,6 +678,7 @@ async function ensureConverted({
       }
 
       fs.renameSync(partPath, finalPath);
+      recentErrors.delete(cacheKey);
       setImmediate(pruneCache);
       return {
         filePath: finalPath,
@@ -673,6 +686,12 @@ async function ensureConverted({
         contentType,
         ext,
       };
+    } catch (err) {
+      recentErrors.set(cacheKey, {
+        message: String(err.message || err),
+        ts: Date.now(),
+      });
+      throw err;
     } finally {
       try {
         if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
@@ -691,15 +710,31 @@ async function ensureConverted({
   }
 }
 
+function getCachedFileInfo({ source, trackId, quality, out, sourceCodec }) {
+  ensureCacheDir();
+  const ext = out === "mp3" ? "mp3" : "m4a";
+  const contentType = out === "mp3" ? "audio/mpeg" : "audio/mp4";
+  const cacheKey = buildCacheKey({ source, trackId, quality, out, sourceCodec });
+  const finalPath = path.join(CACHE_DIR, `${cacheKey}.${ext}`);
+  try {
+    const st = fs.statSync(finalPath);
+    if (st.size > 0 && Date.now() - st.mtimeMs < CACHE_TTL_MS) {
+      return { filePath: finalPath, size: st.size, contentType, ext, cacheKey };
+    }
+  } catch (_) {}
+  return { filePath: null, cacheKey };
+}
+
 function serveFile(req, res, fileInfo, { filename, isDownload }) {
   const { filePath, size, contentType, ext } = fileInfo;
-  const disposition = isDownload ? "attachment" : "inline";
   const baseHeaders = {
     ...CORS_HEADERS,
     "Content-Type": contentType,
     "Accept-Ranges": "bytes",
-    "Content-Disposition": `${disposition}; filename="${filename}.${ext}"`,
     "Cache-Control": "public, max-age=1800",
+    ...(isDownload
+      ? { "Content-Disposition": `attachment; filename="${filename}.${ext}"` }
+      : {}),
   };
 
   const rangeHeader = req.headers.range;
@@ -788,11 +823,12 @@ function createConverterServer(options = {}) {
       });
     }
 
+    const isPrepareRoute = u.pathname === "/prepare";
     const isConvertRoute =
       u.pathname === "/convert" ||
       u.pathname === "/convert.m4a" ||
       u.pathname === "/convert.mp3";
-    if (!isConvertRoute) {
+    if (!isConvertRoute && !isPrepareRoute) {
       return sendJson(res, 404, { error: "unknown endpoint" });
     }
 
@@ -825,6 +861,52 @@ function createConverterServer(options = {}) {
     const filename = sanitizeFilename(u.searchParams.get("filename"));
     const isDownload = u.searchParams.get("download") === "1";
     const isPrefetch = u.searchParams.get("prefetch") === "1";
+
+    if (isPrepareRoute) {
+      const cached = getCachedFileInfo({
+        source,
+        trackId,
+        quality,
+        out,
+        sourceCodec,
+      });
+      if (cached.filePath) {
+        return sendJson(res, 200, { status: "ready", size: cached.size });
+      }
+      const prevErr = recentErrors.get(cached.cacheKey);
+      if (prevErr && Date.now() - prevErr.ts < ERROR_CACHE_MS) {
+        return sendJson(res, 200, { status: "error", error: prevErr.message });
+      }
+
+      const waitMs = Math.min(
+        8000,
+        Math.max(0, Number(u.searchParams.get("waitMs") || 2500))
+      );
+      const job = ensureConverted({
+        source,
+        trackId,
+        quality,
+        out,
+        sourceCodec,
+        ffmpegBin,
+      });
+      /* Prevent unhandled rejection if job fails after waitMs expires. */
+      job.catch(() => {});
+
+      const outcome = await Promise.race([
+        job
+          .then((info) => ({ status: "ready", size: info.size }))
+          .catch((err) => ({
+            status: "error",
+            error: String(err.message || err).slice(-300),
+          })),
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ status: "converting" }), waitMs)
+        ),
+      ]);
+
+      return sendJson(res, outcome.status === "converting" ? 202 : 200, outcome);
+    }
 
     if (isPrefetch) {
       ensureConverted({
