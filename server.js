@@ -1,21 +1,13 @@
 /**
  * SoundCloud HLS -> M4A/MP3 converter (Render.com edition).
  *
- * GET /convert?url=<m3u8-or-audio-url>[&licenseAuthToken=<token>][&key=<secret>][&filename=<name>][&out=m4a|mp3][&sourceCodec=aac|mp3|opus][&trackId=<id>][&quality=<q>][&download=1][&prefetch=1]
+ * GET /convert.m4a?url=<m3u8-or-audio-url>[&licenseAuthToken=<token>][&key=<secret>][&filename=<name>][&out=m4a|mp3][&sourceCodec=aac|mp3|opus][&trackId=<id>][&quality=<q>][&download=1][&prefetch=1]
+ * (Also supports /convert and /convert.mp3)
  *
- * Converts SoundCloud HLS playlists into a complete, +faststart .m4a (or .mp3)
- * file on disk BEFORE serving, with full Content-Length and HTTP Range (206)
- * support. This fixes iOS AVPlayer / Eclipse playback stalling ("just loading")
- * and ensures offline downloads receive a single valid, seekable audio file.
- *
- * Env vars:
- *   PORT                - listen port (Render sets this automatically)
- *   CONVERTER_KEY       - optional shared secret; if set, requests must pass ?key=
- *   FFMPEG_PATH         - optional path to an ffmpeg binary (overrides bundled one)
- *   CACHE_DIR           - optional cache directory (defaults to os.tmpdir()/sc-hls-to-m4a-cache)
- *   MAX_CACHE_BYTES     - optional max disk cache size in bytes (default 300MB)
- *   CACHE_TTL_MS        - optional cache entry TTL in ms (default 30 min)
- *   CONVERSION_TIMEOUT_MS - optional ffmpeg timeout in ms (default 120s)
+ * Downloads HLS playlists and segments concurrently in Node.js (avoiding
+ * ffmpeg-static DNS/TLS segfaults on Linux containers), then remuxes locally
+ * with ffmpeg (+faststart) or falls back to pure-JS fMP4 assembly if needed.
+ * Serves the finished file with exact Content-Length and HTTP Range (206).
  */
 
 const http = require("http");
@@ -23,7 +15,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 
 const PORT = Number(process.env.PORT) || 3000;
 const KEY = process.env.CONVERTER_KEY || "";
@@ -35,15 +27,32 @@ const MAX_CACHE_BYTES =
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 30 * 60 * 1000;
 const CONVERSION_TIMEOUT_MS =
   Number(process.env.CONVERSION_TIMEOUT_MS) || 120 * 1000;
+const SEGMENT_CONCURRENCY = 6;
 
-/* Find ffmpeg: env override, bundled ffmpeg-static (npm), or system PATH. */
-let FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
-if (!process.env.FFMPEG_PATH) {
+function resolveWorkingFfmpeg() {
+  const candidates = [];
+  if (process.env.FFMPEG_PATH) candidates.push(process.env.FFMPEG_PATH);
   try {
     const ffmpegStatic = require("ffmpeg-static");
-    if (ffmpegStatic) FFMPEG = ffmpegStatic;
+    if (ffmpegStatic) candidates.push(ffmpegStatic);
   } catch (_) {}
+  candidates.push("ffmpeg");
+
+  for (const bin of candidates) {
+    try {
+      const out = execFileSync(bin, ["-version"], {
+        timeout: 4000,
+        stdio: ["ignore", "pipe", "pipe"],
+      }).toString();
+      const firstLine = out.split(/\r?\n/)[0] || "ok";
+      return { bin, ok: true, version: firstLine };
+    } catch (_) {}
+  }
+  return { bin: candidates[0] || "ffmpeg", ok: false, version: null };
 }
+
+const FFMPEG_INFO = resolveWorkingFfmpeg();
+const FFMPEG = FFMPEG_INFO.bin;
 
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
@@ -185,7 +194,7 @@ function runFfmpeg(args, timeoutMs = CONVERSION_TIMEOUT_MS, ffmpegBin = FFMPEG) 
       reject(e);
     });
 
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       clearTimeout(timer);
       if (timedOut) {
         const e = new Error("ffmpeg conversion timed out");
@@ -193,24 +202,269 @@ function runFfmpeg(args, timeoutMs = CONVERSION_TIMEOUT_MS, ffmpegBin = FFMPEG) 
         return reject(e);
       }
       if (code === 0) return resolve();
-      const e = new Error(errBuf.trim() || `ffmpeg exited with code ${code}`);
+      const why = signal ? `signal ${signal}` : `code ${code}`;
+      const e = new Error(errBuf.trim() || `ffmpeg exited with ${why}`);
       e.code = "FFMPEG_FAILED";
       e.exitCode = code;
+      e.signal = signal;
       reject(e);
     });
   });
 }
 
-function buildFfmpegStrategies({ source, out, sourceCodec, partPath }) {
+async function fetchBuffer(url, timeoutMs = 25000) {
+  const resp = await fetch(url, {
+    headers: { "User-Agent": UA },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!resp.ok) {
+    throw new Error(`Upstream HTTP ${resp.status} for ${new URL(url).hostname}`);
+  }
+  const ab = await resp.arrayBuffer();
+  return {
+    buf: Buffer.from(ab),
+    contentType: (resp.headers.get("content-type") || "").toLowerCase(),
+  };
+}
+
+function pickMasterVariant(playlistText, baseUrl) {
+  const lines = playlistText.split(/\r?\n/);
+  let bestUrl = null;
+  let bestBw = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith("#EXT-X-STREAM-INF:")) {
+      const bwMatch = /BANDWIDTH=(\d+)/i.exec(line);
+      const bw = bwMatch ? Number(bwMatch[1]) : 0;
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j].trim();
+        if (!next || next.startsWith("#")) continue;
+        if (bw >= bestBw) {
+          bestBw = bw;
+          bestUrl = new URL(next, baseUrl).toString();
+        }
+        break;
+      }
+    }
+  }
+  return bestUrl;
+}
+
+function guessSegmentExt(segUrl) {
+  try {
+    const p = new URL(segUrl).pathname.toLowerCase();
+    const ext = path.extname(p);
+    if (ext && /^[.a-z0-9]{2,6}$/.test(ext)) return ext;
+  } catch (_) {}
+  return ".m4s";
+}
+
+async function downloadSourceToJobDir(sourceUrl, jobDir) {
+  const first = await fetchBuffer(sourceUrl);
+  const firstText = first.buf.slice(0, 512).toString("utf8");
+
+  /* Direct audio file (non-HLS) */
+  if (!firstText.includes("#EXTM3U")) {
+    const ext = guessSegmentExt(sourceUrl) || ".bin";
+    const inputPath = path.join(jobDir, `input${ext}`);
+    fs.writeFileSync(inputPath, first.buf);
+    return {
+      mode: "direct",
+      inputPath,
+      initPath: null,
+      segmentPaths: [],
+      totalDurationSec: 0,
+    };
+  }
+
+  let playlistUrl = sourceUrl;
+  let playlistText = first.buf.toString("utf8");
+
+  if (playlistText.includes("#EXT-X-STREAM-INF")) {
+    const variantUrl = pickMasterVariant(playlistText, playlistUrl);
+    if (!variantUrl) throw new Error("Empty HLS master playlist");
+    const variant = await fetchBuffer(variantUrl);
+    playlistUrl = variantUrl;
+    playlistText = variant.buf.toString("utf8");
+  }
+
+  const lines = playlistText.split(/\r?\n/);
+  const downloads = [];
+  const rewrittenLines = [];
+  let initPath = null;
+  const segmentPaths = [];
+  let totalDurationSec = 0;
+  let segIndex = 0;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      rewrittenLines.push(rawLine);
+      continue;
+    }
+
+    if (line.startsWith("#EXTINF:")) {
+      const m = /^#EXTINF:([0-9.]+)/.exec(line);
+      if (m) totalDurationSec += Number(m[1]) || 0;
+      rewrittenLines.push(rawLine);
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-MAP:")) {
+      const uriMatch = /URI="([^"]+)"/.exec(line);
+      if (uriMatch) {
+        const absUrl = new URL(uriMatch[1], playlistUrl).toString();
+        const localName = `init${guessSegmentExt(absUrl)}`;
+        initPath = path.join(jobDir, localName);
+        downloads.push({ url: absUrl, dest: initPath });
+        rewrittenLines.push(line.replace(uriMatch[1], localName));
+        continue;
+      }
+    }
+
+    if (line.startsWith("#EXT-X-KEY:")) {
+      if (/METHOD=(SAMPLE-AES|FAIRPLAY|WIDEVINE)/i.test(line)) {
+        throw new Error("DRM-encrypted HLS stream is not supported");
+      }
+      const uriMatch = /URI="([^"]+)"/.exec(line);
+      if (uriMatch) {
+        const absUrl = new URL(uriMatch[1], playlistUrl).toString();
+        const localName = "key.bin";
+        downloads.push({ url: absUrl, dest: path.join(jobDir, localName) });
+        rewrittenLines.push(line.replace(uriMatch[1], localName));
+        continue;
+      }
+    }
+
+    if (line.startsWith("#")) {
+      rewrittenLines.push(rawLine);
+      continue;
+    }
+
+    const absSegUrl = new URL(line, playlistUrl).toString();
+    const localName = `seg_${String(segIndex++).padStart(4, "0")}${guessSegmentExt(absSegUrl)}`;
+    const dest = path.join(jobDir, localName);
+    segmentPaths.push(dest);
+    downloads.push({ url: absSegUrl, dest });
+    rewrittenLines.push(localName);
+  }
+
+  if (segmentPaths.length === 0) {
+    throw new Error("HLS playlist contained no media segments");
+  }
+
+  /* Download init + segments concurrently in small batches */
+  let nextIdx = 0;
+  const workers = Array.from(
+    { length: Math.min(SEGMENT_CONCURRENCY, downloads.length) },
+    async () => {
+      while (true) {
+        const idx = nextIdx++;
+        if (idx >= downloads.length) break;
+        const item = downloads[idx];
+        const { buf } = await fetchBuffer(item.url);
+        fs.writeFileSync(item.dest, buf);
+      }
+    }
+  );
+  await Promise.all(workers);
+
+  const localPlaylistPath = path.join(jobDir, "local.m3u8");
+  fs.writeFileSync(localPlaylistPath, rewrittenLines.join("\n"));
+
+  return {
+    mode: "hls",
+    inputPath: localPlaylistPath,
+    initPath,
+    segmentPaths,
+    totalDurationSec,
+  };
+}
+
+/**
+ * Pure-JS fMP4 box duration patcher + concatenator fallback.
+ * Used only if ffmpeg is unavailable or crashes on the host.
+ */
+function patchBoxDurations(buf, start, end, totalDurationSec, mvhdTimescale = 44100) {
+  let offset = start;
+  let ts = mvhdTimescale;
+
+  while (offset + 8 <= end) {
+    const size = buf.readUInt32BE(offset);
+    if (size < 8 || offset + size > end) break;
+    const type = buf.toString("ascii", offset + 4, offset + 8);
+
+    if (type === "moov" || type === "trak" || type === "mdia" || type === "mvex") {
+      ts = patchBoxDurations(buf, offset + 8, offset + size, totalDurationSec, ts);
+    } else if (type === "mvhd" && size >= 28) {
+      const version = buf[offset + 8];
+      if (version === 0 && offset + 28 <= end) {
+        ts = buf.readUInt32BE(offset + 20) || ts;
+        buf.writeUInt32BE(Math.round(totalDurationSec * ts), offset + 24);
+      } else if (version === 1 && offset + 40 <= end) {
+        ts = buf.readUInt32BE(offset + 28) || ts;
+        buf.writeBigUInt64BE(BigInt(Math.round(totalDurationSec * ts)), offset + 32);
+      }
+    } else if (type === "tkhd" && size >= 32) {
+      const version = buf[offset + 8];
+      if (version === 0 && offset + 32 <= end) {
+        buf.writeUInt32BE(Math.round(totalDurationSec * ts), offset + 28);
+      } else if (version === 1 && offset + 44 <= end) {
+        buf.writeBigUInt64BE(BigInt(Math.round(totalDurationSec * ts)), offset + 36);
+      }
+    } else if (type === "mdhd" && size >= 28) {
+      const version = buf[offset + 8];
+      if (version === 0 && offset + 28 <= end) {
+        const mdTs = buf.readUInt32BE(offset + 20) || ts;
+        buf.writeUInt32BE(Math.round(totalDurationSec * mdTs), offset + 24);
+      } else if (version === 1 && offset + 40 <= end) {
+        const mdTs = buf.readUInt32BE(offset + 28) || ts;
+        buf.writeBigUInt64BE(BigInt(Math.round(totalDurationSec * mdTs)), offset + 32);
+      }
+    } else if (type === "mehd" && size >= 16) {
+      const version = buf[offset + 8];
+      if (version === 0 && offset + 16 <= end) {
+        buf.writeUInt32BE(Math.round(totalDurationSec * ts), offset + 12);
+      } else if (version === 1 && offset + 20 <= end) {
+        buf.writeBigUInt64BE(BigInt(Math.round(totalDurationSec * ts)), offset + 12);
+      }
+    }
+
+    offset += size;
+  }
+  return ts;
+}
+
+function assembleFmp4Fallback({ initPath, segmentPaths, totalDurationSec, partPath }) {
+  if (!initPath || !fs.existsSync(initPath) || !segmentPaths.length) {
+    return false;
+  }
+  const initBuf = Buffer.from(fs.readFileSync(initPath));
+  if (totalDurationSec > 0) {
+    patchBoxDurations(initBuf, 0, initBuf.length, totalDurationSec);
+  }
+  const fd = fs.openSync(partPath, "w");
+  try {
+    fs.writeSync(fd, initBuf);
+    for (const seg of segmentPaths) {
+      const b = fs.readFileSync(seg);
+      fs.writeSync(fd, b);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return fs.statSync(partPath).size > 0;
+}
+
+function buildFfmpegStrategies({ inputPath, isHlsInput, out, sourceCodec, partPath }) {
   const inputArgs = [
     "-hide_banner",
     "-loglevel",
     "error",
     "-y",
-    "-user_agent",
-    UA,
+    ...(isHlsInput ? ["-allowed_extensions", "ALL"] : []),
     "-i",
-    source,
+    inputPath,
     "-vn",
     "-map",
     "0:a:0",
@@ -234,7 +488,6 @@ function buildFfmpegStrategies({ source, out, sourceCodec, partPath }) {
     return strategies;
   }
 
-  /* Default: M4A (AAC in MP4 with moov atom moved to byte 0 via +faststart) */
   const strategies = [];
   if (sourceCodec !== "opus") {
     strategies.push([
@@ -293,7 +546,6 @@ function pruneCache() {
       })
       .filter(Boolean);
 
-    /* Delete expired entries first (never delete files actively being read or <60s old). */
     const kept = [];
     for (const entry of entries) {
       const readers = activeReads.get(entry.full) || 0;
@@ -336,7 +588,6 @@ async function ensureConverted({
   const cacheKey = buildCacheKey({ source, trackId, quality, out, sourceCodec });
   const finalPath = path.join(CACHE_DIR, `${cacheKey}.${ext}`);
 
-  /* Fast path: hit warm disk cache. */
   try {
     const st = fs.statSync(finalPath);
     if (st.size > 0 && Date.now() - st.mtimeMs < CACHE_TTL_MS) {
@@ -346,47 +597,88 @@ async function ensureConverted({
     }
   } catch (_) {}
 
-  /* Deduplicate concurrent requests (e.g. AVPlayer probe + range + prefetch). */
   if (inflight.has(cacheKey)) {
     return inflight.get(cacheKey);
   }
 
   const job = (async () => {
-    const partPath = `${finalPath}.${process.pid}.${Date.now()}.${Math.random()
-      .toString(36)
-      .slice(2, 8)}.part`;
+    const jobDir = fs.mkdtempSync(path.join(CACHE_DIR, "job-"));
+    const partPath = `${finalPath}.${process.pid}.${Date.now()}.part`;
 
-    const strategies = buildFfmpegStrategies({
-      source,
-      out,
-      sourceCodec,
-      partPath,
-    });
-
-    let lastErr = null;
     try {
-      for (const args of strategies) {
-        try {
-          await runFfmpeg(args, CONVERSION_TIMEOUT_MS, ffmpegBin);
-          const st = fs.statSync(partPath);
-          if (st.size > 0) {
-            fs.renameSync(partPath, finalPath);
-            setImmediate(pruneCache);
-            return { filePath: finalPath, size: st.size, contentType, ext };
-          }
-          lastErr = new Error("ffmpeg produced empty output");
-        } catch (err) {
-          lastErr = err;
+      const downloaded = await downloadSourceToJobDir(source, jobDir);
+
+      /* If direct MP3 and out=mp3, no ffmpeg needed at all. */
+      if (downloaded.mode === "direct" && out === "mp3" && sourceCodec === "mp3") {
+        fs.renameSync(downloaded.inputPath, finalPath);
+        setImmediate(pruneCache);
+        return {
+          filePath: finalPath,
+          size: fs.statSync(finalPath).size,
+          contentType,
+          ext,
+        };
+      }
+
+      const strategies = buildFfmpegStrategies({
+        inputPath: downloaded.inputPath,
+        isHlsInput: downloaded.mode === "hls",
+        out,
+        sourceCodec,
+        partPath,
+      });
+
+      let lastErr = null;
+      let convertedOk = false;
+
+      if (FFMPEG_INFO.ok || ffmpegBin !== FFMPEG) {
+        for (const args of strategies) {
           try {
-            fs.unlinkSync(partPath);
-          } catch (_) {}
-          if (err.code === "FFMPEG_SPAWN") throw err;
+            await runFfmpeg(args, CONVERSION_TIMEOUT_MS, ffmpegBin);
+            const st = fs.statSync(partPath);
+            if (st.size > 0) {
+              convertedOk = true;
+              break;
+            }
+            lastErr = new Error("ffmpeg produced empty output");
+          } catch (err) {
+            lastErr = err;
+            try {
+              fs.unlinkSync(partPath);
+            } catch (_) {}
+          }
         }
       }
-      throw lastErr || new Error("ffmpeg conversion failed");
+
+      /* Pure-JS fMP4 fallback if ffmpeg crashed/missing and source is fMP4 HLS */
+      if (!convertedOk && out === "m4a" && downloaded.initPath) {
+        const ok = assembleFmp4Fallback({
+          initPath: downloaded.initPath,
+          segmentPaths: downloaded.segmentPaths,
+          totalDurationSec: downloaded.totalDurationSec,
+          partPath,
+        });
+        if (ok) convertedOk = true;
+      }
+
+      if (!convertedOk) {
+        throw lastErr || new Error("conversion failed");
+      }
+
+      fs.renameSync(partPath, finalPath);
+      setImmediate(pruneCache);
+      return {
+        filePath: finalPath,
+        size: fs.statSync(finalPath).size,
+        contentType,
+        ext,
+      };
     } finally {
       try {
         if (fs.existsSync(partPath)) fs.unlinkSync(partPath);
+      } catch (_) {}
+      try {
+        fs.rmSync(jobDir, { recursive: true, force: true });
       } catch (_) {}
     }
   })();
@@ -488,7 +780,12 @@ function createConverterServer(options = {}) {
     const u = new URL(req.url, "http://localhost");
 
     if (u.pathname === "/health") {
-      return sendJson(res, 200, { ok: true, service: "sc-hls-to-m4a" });
+      return sendJson(res, 200, {
+        ok: true,
+        service: "sc-hls-to-m4a",
+        ffmpegOk: FFMPEG_INFO.ok,
+        ffmpegVersion: FFMPEG_INFO.version,
+      });
     }
 
     const isConvertRoute =
@@ -571,7 +868,7 @@ if (require.main === module) {
   const server = createConverterServer();
   server.listen(PORT, () => {
     console.log(`sc-hls-to-m4a listening on :${PORT}`);
-    console.log(`using ffmpeg: ${FFMPEG}`);
+    console.log(`ffmpeg: ${FFMPEG} (ok=${FFMPEG_INFO.ok})`);
     console.log(`cache dir: ${CACHE_DIR}`);
   });
 }
@@ -584,4 +881,6 @@ module.exports = {
   buildCacheKey,
   buildFfmpegStrategies,
   isAllowedSoundCloudHost,
+  assembleFmp4Fallback,
+  patchBoxDurations,
 };
