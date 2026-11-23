@@ -23,12 +23,15 @@ const KEY = process.env.CONVERTER_KEY || "";
 const CACHE_DIR =
   process.env.CACHE_DIR || path.join(os.tmpdir(), "sc-hls-to-m4a-cache");
 const MAX_CACHE_BYTES =
-  Number(process.env.MAX_CACHE_BYTES) || 300 * 1024 * 1024;
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 30 * 60 * 1000;
+  Number(process.env.MAX_CACHE_BYTES) || 400 * 1024 * 1024;
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 2 * 60 * 60 * 1000;
 const CONVERSION_TIMEOUT_MS =
   Number(process.env.CONVERSION_TIMEOUT_MS) || 120 * 1000;
-const SEGMENT_CONCURRENCY = 10;
+const SEGMENT_CONCURRENCY = 16;
 const ERROR_CACHE_MS = 15 * 1000;
+const KEEPALIVE_IDLE_MS =
+  Number(process.env.KEEPALIVE_IDLE_MS) || 13.5 * 60 * 1000;
+const SERVER_STARTED_AT = Date.now();
 
 function resolveWorkingFfmpeg() {
   const candidates = [];
@@ -235,7 +238,7 @@ function runFfmpeg(args, timeoutMs = CONVERSION_TIMEOUT_MS, ffmpegBin = FFMPEG) 
   });
 }
 
-async function fetchBufferOnce(url, timeoutMs = 25000) {
+async function fetchBufferOnce(url, timeoutMs = 15000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -260,13 +263,13 @@ async function fetchBufferOnce(url, timeoutMs = 25000) {
   }
 }
 
-async function fetchBuffer(url, timeoutMs = 25000) {
+async function fetchBuffer(url, timeoutMs = 15000) {
   try {
     return await fetchBufferOnce(url, timeoutMs);
   } catch (err) {
     const status = err && err.status;
     if (status && status >= 400 && status < 500 && status !== 429) throw err;
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 200));
     return fetchBufferOnce(url, timeoutMs);
   }
 }
@@ -311,7 +314,7 @@ async function downloadSourceToJobDir(sourceUrl, jobDir) {
   if (!firstText.includes("#EXTM3U")) {
     const ext = guessSegmentExt(sourceUrl) || ".bin";
     const inputPath = path.join(jobDir, `input${ext}`);
-    fs.writeFileSync(inputPath, first.buf);
+    await fs.promises.writeFile(inputPath, first.buf);
     return {
       mode: "direct",
       inputPath,
@@ -336,6 +339,8 @@ async function downloadSourceToJobDir(sourceUrl, jobDir) {
   const downloads = [];
   const rewrittenLines = [];
   let initPath = null;
+  let hasInit = false;
+  let hasKey = false;
   const segmentPaths = [];
   let totalDurationSec = 0;
   let segIndex = 0;
@@ -360,7 +365,8 @@ async function downloadSourceToJobDir(sourceUrl, jobDir) {
         const absUrl = new URL(uriMatch[1], playlistUrl).toString();
         const localName = `init${guessSegmentExt(absUrl)}`;
         initPath = path.join(jobDir, localName);
-        downloads.push({ url: absUrl, dest: initPath });
+        hasInit = true;
+        downloads.push({ url: absUrl, dest: initPath, isInit: true });
         rewrittenLines.push(line.replace(uriMatch[1], localName));
         continue;
       }
@@ -372,6 +378,7 @@ async function downloadSourceToJobDir(sourceUrl, jobDir) {
       }
       const uriMatch = /URI="([^"]+)"/.exec(line);
       if (uriMatch) {
+        hasKey = true;
         const absUrl = new URL(uriMatch[1], playlistUrl).toString();
         const localName = "key.bin";
         downloads.push({ url: absUrl, dest: path.join(jobDir, localName) });
@@ -397,7 +404,16 @@ async function downloadSourceToJobDir(sourceUrl, jobDir) {
     throw new Error("HLS playlist contained no media segments");
   }
 
-  /* Download init + segments concurrently in small batches */
+  /* Fast path for unencrypted fMP4 HLS tracks (<120 segments):
+     download concurrently into memory, write one concat.mp4 file, and let ffmpeg
+     remux in a single open() instead of opening 15-80 separate files via m3u8. */
+  const useSingleConcat =
+    hasInit &&
+    !hasKey &&
+    downloads.length < 120 &&
+    Boolean(downloads[0] && downloads[0].isInit);
+  const buffers = useSingleConcat ? new Array(downloads.length) : null;
+
   let nextIdx = 0;
   const workers = Array.from(
     { length: Math.min(SEGMENT_CONCURRENCY, downloads.length) },
@@ -407,14 +423,31 @@ async function downloadSourceToJobDir(sourceUrl, jobDir) {
         if (idx >= downloads.length) break;
         const item = downloads[idx];
         const { buf } = await fetchBuffer(item.url);
-        fs.writeFileSync(item.dest, buf);
+        if (useSingleConcat) {
+          buffers[idx] = buf;
+        } else {
+          await fs.promises.writeFile(item.dest, buf);
+        }
       }
     }
   );
   await Promise.all(workers);
 
+  if (useSingleConcat) {
+    const concatPath = path.join(jobDir, "concat.mp4");
+    await fs.promises.writeFile(concatPath, Buffer.concat(buffers));
+    return {
+      mode: "concat",
+      inputPath: concatPath,
+      initPath: null,
+      segmentPaths: [],
+      totalDurationSec,
+      segmentCount: segmentPaths.length,
+    };
+  }
+
   const localPlaylistPath = path.join(jobDir, "local.m3u8");
-  fs.writeFileSync(localPlaylistPath, rewrittenLines.join("\n"));
+  await fs.promises.writeFile(localPlaylistPath, rewrittenLines.join("\n"));
 
   return {
     mode: "hls",
@@ -422,6 +455,7 @@ async function downloadSourceToJobDir(sourceUrl, jobDir) {
     initPath,
     segmentPaths,
     totalDurationSec,
+    segmentCount: segmentPaths.length,
   };
 }
 
@@ -517,14 +551,16 @@ function buildFfmpegStrategies({ inputPath, isHlsInput, out, sourceCodec, partPa
   if (out === "mp3") {
     const strategies = [];
     if (sourceCodec !== "opus") {
-      strategies.push([...inputArgs, "-c:a", "copy", "-f", "mp3", partPath]);
+      strategies.push([...inputArgs, "-c:a", "copy", "-id3v2_version", "3", "-f", "mp3", partPath]);
     }
     strategies.push([
       ...inputArgs,
       "-c:a",
       "libmp3lame",
       "-q:a",
-      "2",
+      "0",
+      "-id3v2_version",
+      "3",
       "-f",
       "mp3",
       partPath,
@@ -671,7 +707,8 @@ async function ensureConverted({
       const downloaded = await downloadSourceToJobDir(source, jobDir);
       inflightMeta.set(cacheKey, {
         totalDurationSec: downloaded.totalDurationSec || 0,
-        segmentCount: downloaded.segmentPaths.length || 0,
+        segmentCount:
+          downloaded.segmentCount || downloaded.segmentPaths.length || 0,
       });
 
       /* If direct MP3 and out=mp3, no ffmpeg needed at all. */
@@ -781,6 +818,7 @@ function getCachedFileInfo({ source, trackId, quality, out, sourceCodec }) {
 }
 
 function serveFile(req, res, fileInfo, { filename, isDownload }) {
+  if (req.socket && req.socket.setNoDelay) req.socket.setNoDelay(true);
   const { filePath, size, contentType, ext } = fileInfo;
   let mtimeUtc;
   try {
@@ -791,7 +829,7 @@ function serveFile(req, res, fileInfo, { filename, isDownload }) {
     ...CORS_HEADERS,
     "Content-Type": contentType,
     "Accept-Ranges": "bytes",
-    "Cache-Control": "public, max-age=1800",
+    "Cache-Control": "public, max-age=3600",
     ETag: etag,
     ...(mtimeUtc ? { "Last-Modified": mtimeUtc } : {}),
     ...(isDownload
@@ -800,6 +838,11 @@ function serveFile(req, res, fileInfo, { filename, isDownload }) {
   };
 
   const rangeHeader = req.headers.range;
+  if (!rangeHeader && req.headers["if-none-match"] === etag) {
+    res.writeHead(304, baseHeaders);
+    return res.end();
+  }
+
   if (rangeHeader) {
     const parsed = parseRange(rangeHeader, size);
     if (parsed && parsed.unsatisfiable) {
@@ -820,7 +863,11 @@ function serveFile(req, res, fileInfo, { filename, isDownload }) {
       if (req.method === "HEAD") return res.end();
 
       activeReads.set(filePath, (activeReads.get(filePath) || 0) + 1);
-      const stream = fs.createReadStream(filePath, { start, end });
+      const stream = fs.createReadStream(filePath, {
+        start,
+        end,
+        highWaterMark: 256 * 1024,
+      });
       let decremented = false;
       const done = () => {
         if (decremented) return;
@@ -846,7 +893,7 @@ function serveFile(req, res, fileInfo, { filename, isDownload }) {
   if (req.method === "HEAD") return res.end();
 
   activeReads.set(filePath, (activeReads.get(filePath) || 0) + 1);
-  const stream = fs.createReadStream(filePath);
+  const stream = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
   let decremented = false;
   const done = () => {
     if (decremented) return;
@@ -867,8 +914,12 @@ function serveFile(req, res, fileInfo, { filename, isDownload }) {
 function createConverterServer(options = {}) {
   const ffmpegBin = options.ffmpegBin || FFMPEG;
   const keySecret = options.key !== undefined ? options.key : KEY;
+  let lastRequestAt = Date.now();
 
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
+    lastRequestAt = Date.now();
+    if (req.socket && req.socket.setNoDelay) req.socket.setNoDelay(true);
+
     if (req.method === "OPTIONS") {
       const reqHeaders = req.headers["access-control-request-headers"];
       res.writeHead(204, {
@@ -880,10 +931,11 @@ function createConverterServer(options = {}) {
 
     const u = new URL(req.url, "http://localhost");
 
-    if (u.pathname === "/health") {
+    if (u.pathname === "/health" || u.pathname === "/ping" || u.pathname === "/wake") {
       return sendJson(res, 200, {
         ok: true,
         service: "sc-hls-to-m4a",
+        uptimeSec: Math.round((Date.now() - SERVER_STARTED_AT) / 1000),
         ffmpegOk: FFMPEG_INFO.ok,
         ffmpegVersion: FFMPEG_INFO.version,
       });
@@ -1090,15 +1142,53 @@ function createConverterServer(options = {}) {
       });
     }
   });
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.getLastRequestAt = () => lastRequestAt;
+  return server;
+}
+
+function startIdleKeepAlive(server, externalUrl) {
+  const base = String(externalUrl || "").replace(/\/+$/, "");
+  if (!base || process.env.DISABLE_KEEPALIVE === "1") return null;
+
+  let pinging = false;
+  const timer = setInterval(async () => {
+    if (pinging) return;
+    const idleMs = Date.now() - server.getLastRequestAt();
+    if (idleMs < KEEPALIVE_IDLE_MS) return;
+
+    pinging = true;
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 10000);
+      await fetch(`${base}/health?keepalive=1`, {
+        headers: { "User-Agent": "sc-keepalive/1.0" },
+        signal: controller.signal,
+      }).finally(() => clearTimeout(t));
+    } catch (_) {
+    } finally {
+      pinging = false;
+    }
+  }, 60 * 1000);
+
+  if (timer.unref) timer.unref();
+  return timer;
 }
 
 if (require.main === module) {
   ensureCacheDir();
   const server = createConverterServer();
+  const keepaliveUrl =
+    process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || "";
   server.listen(PORT, () => {
     console.log(`sc-hls-to-m4a listening on :${PORT}`);
     console.log(`ffmpeg: ${FFMPEG} (ok=${FFMPEG_INFO.ok})`);
     console.log(`cache dir: ${CACHE_DIR}`);
+    if (keepaliveUrl) {
+      startIdleKeepAlive(server, keepaliveUrl);
+      console.log(`idle keepalive armed for ${keepaliveUrl} (after ${Math.round(KEEPALIVE_IDLE_MS / 60000)}m idle)`);
+    }
   });
 }
 
